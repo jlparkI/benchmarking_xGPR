@@ -1,7 +1,7 @@
 # benchmarking_xGPR
 
 This repo contains code used to benchmark the xGPR package,
-version 0.0.2.4, for Parkinson et al. 2023. It is highly
+version 0.1.1.6, for Parkinson et al. 2023. It is highly
 recommended to use this version of xGPR when running
 scripts from this repository. For more information about
 the xGPR package, refer to [the docs](https://xgpr.readthedocs.io/en/latest/index.html).
@@ -10,7 +10,7 @@ the xGPR package, refer to [the docs](https://xgpr.readthedocs.io/en/latest/inde
 
 To run this repo, you will need to install the dependencies
 under requirements.txt. This is designed to run on Linux
-and requires CUDA. xGPR itself it should be noted requires
+and requires a GPU with CUDA. xGPR itself it should be noted requires
 only numpy, cupy, Cython, CUDA >= 10.0, and
 scikit-learn. The majority of
 the dependencies are not required in order for xGPR to run;
@@ -43,8 +43,21 @@ which will retrieve a list like the following:
 ![build datasets](images/build_datasets.png)
 
 so that you can construct the datasets most relevant to the experiments
-that interest you. Note that some datasets may take a while to
-download and / or construct.
+that interest you. Note that the amount of disk space taken up by all
+constructed datasets is quite substantial (about 150 GB). This is
+because there are many datasets, some of the datasets have a substantial
+memory footprint in and of themselves (e.g. QM9), the feature representations
+for some datasets (e.g. SOAP features for QM9 and ESM embeddings for
+sequences) are large, and many datasets are encoded using more than
+one feature representation to permit comparisons.
+
+Feature construction does not take up very much memory for *most* operations
+with the exception of generating ESM (large language model) embeddings for protein sequences,
+which can require substantial memory (>8 GB of RAM for some datasets) due to the large size
+of the FAIR-ESM model and the embeddings it generates; we have tried to minimize these
+requirements by processing sequences in small batches. Generating the ESM embeddings
+is the slowest step in the feature construction process. Overall, building all the
+features for the various datasets is likely to take a few hours.
 
 ### Running experiments
 
@@ -70,6 +83,10 @@ from ``kernel_sel``. To take another example, the `cg` experiment
 involves fitting 8 different datasets using 8 different settings
 each, some of which are highly nonoptimal and therefore slow.
 Be prepared therefore for each experiment to take some time.
+
+Note that unlike feature construction, fitting using xGPR has a
+relatively small memory footprint and can be run easily on a GPU
+with 8 GB of RAM or less.
 
 ### Additional experiments
 

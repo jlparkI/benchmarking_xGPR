@@ -1,8 +1,12 @@
 """Preps the fluorescence dataset (mutations in GFP) for modeling."""
 import os
 import numpy as np
-from .protein_tools.msa_encoding_toolkit import MSAEncodingToolkit
 from Bio import SeqIO
+import esm
+from xGPR.static_layers.fast_conv import FastConv1d
+from .build_esm_reps import generate_esm_embeddings, save_conv_reps
+from .protein_tools.msa_encoding_toolkit import MSAEncodingToolkit
+
 
 def prep_fluorescence(start_dir):
     """Preps the fluorescence dataset for modeling using either a convolution
@@ -11,8 +15,17 @@ def prep_fluorescence(start_dir):
     if "FLUORESCENCE.fasta" not in os.listdir():
         raise ValueError("The fluorescence dataset has not been downloaded yet!")
 
+    esm_model, alphabet = esm.pretrained.esm1v_t33_650M_UR90S_1()
+    batch_converter = alphabet.get_batch_converter()
+    esm_model.eval()
+    esm_model.cuda()
+
+    statlayer = FastConv1d(seq_width = 1280, device = "gpu",
+                        conv_width = [9], num_features = 5000,
+                        mode = "maxpool")
+
     filepaths, yvalues = get_dataset_fps(start_dir)
-    target_dirs = ["onehot", "onehot_conv"]
+    target_dirs = ["onehot_conv", "esm_reps"]
     for i, enc_type in enumerate(target_dirs):
         os.chdir(start_dir)
         os.chdir(os.path.join("benchmark_evals", "fluorescence_eval"))
@@ -20,19 +33,47 @@ def prep_fluorescence(start_dir):
         if target_dirs[i] not in os.listdir():
             os.mkdir(target_dirs[i])
         os.chdir(target_dirs[i])
-        if "standard" not in os.listdir():
-            os.mkdir("standard")
-        os.chdir("standard")
-        if i == 1:
+        if "esm" not in enc_type:
             generate_output_arrays(enc_type, filepaths, yvalues)
         else:
-            generate_output_arrays(enc_type, filepaths, yvalues)
+            generate_esm_arrays(filepaths, yvalues,
+                        esm_model, alphabet, batch_converter,
+                        statlayer)
+
+
     print("Fluorescence encoding is complete.")
+
+
+def generate_esm_arrays(filepaths, yvalues,
+        esm_model, alphabet, batch_converter, statlayer):
+    """Generate ESM embeddings for a specific split."""
+    rep_dir = os.getcwd()
+    if "standard" not in os.listdir():
+        os.mkdir("standard")
+    if "conv" not in os.listdir():
+        os.mkdir("conv")
+
+    ofnames = ["train", "test"]
+
+    for i, (filepath, ofname) in enumerate(zip(filepaths, ofnames)):
+        os.chdir(os.path.join(rep_dir, "standard"))
+
+        with open(filepath, "r") as fhandle:
+            raw_seqs = [str(s.seq) for s in SeqIO.parse(filepath, "fasta")]
+
+        conv_reps = generate_esm_embeddings(ofname, raw_seqs, yvalues[i],
+                esm_model, alphabet, batch_converter, statlayer, 10)
+
+        os.chdir(os.path.join(rep_dir, "conv"))
+        save_conv_reps(ofname, conv_reps, yvalues[i])
 
 
 def generate_output_arrays(enc_type, filepaths, yvalues):
     """Generates output arrays for a specific encoding type
     (either convolution or 'flat')."""
+    if "standard" not in os.listdir():
+        os.mkdir("standard")
+    os.chdir("standard")
     if "conv" in enc_type:
         mode = "conv"
         encoding_name = enc_type.split("_conv")[0]
@@ -47,7 +88,8 @@ def generate_output_arrays(enc_type, filepaths, yvalues):
             os.mkdir(ofname)
         os.chdir(ofname)
         encoder.encode_fasta_file(filepaths[i], np.asarray(yvalues[i]),
-                os.getcwd(), blocksize=2000, mode=mode)
+                os.getcwd(), blocksize=2000, verbose=True,
+                mode=mode)
         os.chdir("..")
 
 

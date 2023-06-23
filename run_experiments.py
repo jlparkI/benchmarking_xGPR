@@ -1,22 +1,16 @@
 """Contains the tools needed to reproduce all major experiments
 from Parkinson et al. 2023."""
-#TODO: The benchmarking code needs some cleanup; refactor once
-#xGPR release is complete.
 import argparse
 import os
-import time
 import sys
 
-import pandas as pd
-import numpy as np
-import cupy as cp
-
-from xGPR.xGP_Regression import xGPRegression
-from xGPR.data_handling.dataset_builder import build_offline_sequence_dataset
-from core_exp_funcs import tune_model_bayes, tune_model_lbfgs, fit_and_score, run_cv
-from core_exp_funcs import get_qm9_train_dataset, get_target_qm9_files
-from core_exp_funcs import get_train_test_datasets, get_train_dataset
-from constants import cg_constants, uci_constants, protein_constants, general_constants
+from core_experiments.constants import protein_constants
+from core_experiments.mol_prop_experiments import molfit
+from core_experiments.prot_engineering_exp import protein_tune, protein_fit, uncertainty_calibration
+from core_experiments.prot_engineering_exp import active_learning
+from core_experiments.comp_efficiency_experiments import run_approx_nmll_tests, run_cg_tests
+from core_experiments.comp_efficiency_experiments import run_fitcomp_tests, run_lbfgs_tests
+from core_experiments.comp_efficiency_experiments import run_optimizer_tests
 
 
 class ReconfigParser(argparse.ArgumentParser):
@@ -27,68 +21,6 @@ class ReconfigParser(argparse.ArgumentParser):
         sys.exit(2)
 
 
-
-def run_approx_nmll_tests(start_dir):
-    """Test the approximate nmll estimation procedure.
-
-    Args:
-        start_dir (str): The dir where this script is located.
-    """
-
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "approx_nmll_log.txt"))
-    target_datasets = ["kin40k_dataset", "song_dataset", "uci_protein_dataset"]
-    target_datasets = [os.path.join(f, "y_norm") for f in target_datasets]
-    target_datasets.append(os.path.join("fluorescence_eval", "onehot", "standard"))
-
-    for split in ["three_vs_rest", "two_vs_rest"]:
-        target_datasets.append(os.path.join("gb1_eval", "onehot", split))
-    for split in ["mut_des_split", "seven_vs_many_split"]:
-        target_datasets.append(os.path.join("aav_eval", "onehot", split))
-    target_datasets = [os.path.join(start_dir, "benchmark_evals", f) for
-                        f in target_datasets]
-
-    xgp = xGPRegression(training_rffs = 4096, fitting_rffs = 4096,
-                        kernel_choice = "RBF", device = "gpu",
-                        verbose = True)
-    rng = np.random.default_rng(123)
-
-    for data_fpath in target_datasets:
-        train_dset, _, _ = get_train_test_datasets(start_dir, data_fpath, "RBF")
-        #In general the user will not initialize a kernel outside of a tuning
-        #or fitting procedure; we are only doing so here for testing purposes.
-        xgp.kernel = xgp._initialize_kernel(xgp.kernel_choice, train_dset.get_xdim(),
-                    xgp.training_rffs, 123)
-        bounds = xgp.kernel.get_bounds()
-
-        print(f"Now working on {data_fpath}")
-        hparam_samples = [rng.uniform(low=bounds[:,0], high=bounds[:,1], size=3)
-                        for i in range(8)]
-
-        for hparams in hparam_samples:
-            #We're going to access some protected member methods here that the
-            #end user will not generally need to access
-            hyperparams = "_".join([str(z) for z in hparams.tolist()])
-            train_dset.device = "gpu"
-            approx_nmll = xgp.approximate_nmll(hparams, train_dset,
-                    max_rank = 512, nsamples = 25, random_seed = 123,
-                    tol = 1e-5)
-            print("Now calculating exact NMLL...this might take a second...")
-            exact_nmll = xgp.exact_nmll(hparams, train_dset)
-
-            z_trans_z, _, _ = xgp._calc_design_mat(train_dset)
-            z_trans_z.flat[::z_trans_z.shape[0]+1] += xgp.kernel.get_lambda()**2
-            _, s_1, _ = cp.linalg.svd(z_trans_z)
-            condition_number = s_1.max() / s_1.min()
-            print(f"{z_trans_z.shape}")
-
-            with open(logpath, "a+", encoding="utf8") as output_file:
-                output_file.write(f"{data_fpath},RBF,"
-                    f"{hyperparams},"
-                    f"{xgp.training_rffs},{exact_nmll},{approx_nmll},"
-                    f"{condition_number}\n")
-
-
 def gen_arg_parser():
     """Build the command line arg parser."""
     parser = ReconfigParser(description="Use this command line app to "
@@ -96,535 +28,14 @@ def gen_arg_parser():
                 "results. Output is printed to the console and written to "
                 "the log files under final_results.")
     parser.add_argument("test", nargs = 1, help=
-            "Test sequence to run. Must be one of: uci, kernel_select, proteins, "
-                        "optimizers, cg, lbfgs, fitcomp, nmll, moltune, molfit, others.")
+            "Test sequence to run. Must be one of: protein_tune,"
+                        "protein_fit, molfit, optimizers, "
+                        "cg, lbfgs, nmll, fitcomp, uncert_calib, "
+                        "active_learn.")
     parser.add_argument("temp_dir", nargs = 1, help=
             "A temporary directory where features generated by the convolution kernels "
-            "can be stored. Used by the conv1d kernel only.")
+            "can be stored.")
     return parser
-
-
-
-
-
-def run_fitcomp_tests(start_dir):
-    """Compare several important fitting methods.
-
-    Args:
-        start_dir (str): The dir where this script is located.
-    """
-
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "fitcomp_log.txt"))
-    target_datasets = ["kin40k_dataset", "song_dataset", "uci_protein_dataset"]
-    target_datasets = [os.path.join(f, "y_norm") for f in target_datasets]
-    target_datasets.append(os.path.join("aav_eval", "onehot", "mut_des_split"))
-    target_datasets = [os.path.join(start_dir, "benchmark_evals", f) for
-                        f in target_datasets]
-
-    for data_fpath, hparams, max_rank in zip(target_datasets,
-                    cg_constants.fitcomp_preset_hyperparams,
-                    cg_constants.fitcomp_max_rank):
-        train_dset, _, _ = get_train_test_datasets(start_dir, data_fpath, "RBF")
-        print(f"Now working on {data_fpath}, {max_rank}")
-        xgp = xGPRegression(training_rffs = 512,
-                        variance_rffs = 64, fitting_rffs = 16384,
-                        kernel_choice = "RBF", device = "gpu",
-                        verbose = True)
-        preconditioner, ratio = xgp.build_preconditioner(train_dset,
-                        max_rank = max_rank, preset_hyperparams = hparams)
-
-        _, losses = xgp.fit(train_dset, tol = 1e-6,
-                        preset_hyperparams = hparams,
-                        run_diagnostics = True,
-                        max_iter = 100,
-                        mode = "cg_test")
-        losses = "_".join([str(z) for z in losses])
-        hyperparams = "_".join([str(z) for z in hparams.tolist()])
-        with open(logpath, "a+", encoding="utf8") as output_file:
-            output_file.write(f"{data_fpath},RBF,"
-                        f"{hyperparams},"
-                        f"16384,CG,NA,"
-                        f"no_preconditioner,{losses}\n")
-
-        _, losses = xgp.fit(train_dset, tol = 1e-6,
-                        preset_hyperparams = hparams,
-                        run_diagnostics = True,
-                        max_iter = 100,
-                        mode = "sgd")
-        losses = "_".join([str(z) for z in losses])
-        hyperparams = "_".join([str(z) for z in hparams.tolist()])
-        with open(logpath, "a+", encoding="utf8") as output_file:
-            output_file.write(f"{data_fpath},RBF,"
-                        f"{hyperparams},"
-                        f"16384,SVRG,NA,"
-                        f"no_preconditioner,{losses}\n")
-
-        _, losses = xgp.fit(train_dset, tol = 1e-6,
-                        preset_hyperparams = hparams,
-                        run_diagnostics = True,
-                        max_iter = 100,
-                        mode = "amsgrad")
-        losses = "_".join([str(z) for z in losses])
-        hyperparams = "_".join([str(z) for z in hparams.tolist()])
-        with open(logpath, "a+", encoding="utf8") as output_file:
-            output_file.write(f"{data_fpath},RBF,"
-                        f"{hyperparams},"
-                        f"16384,AMSGrad,NA,"
-                        f"no_preconditioner,{losses}\n")
-
-        _, losses = xgp.fit(train_dset, tol = 1e-6,
-                        preset_hyperparams = hparams,
-                        run_diagnostics = True,
-                        max_iter = 100,
-                        preconditioner = preconditioner,
-                        mode = "cg_test")
-        losses = "_".join([str(z) for z in losses])
-        hyperparams = "_".join([str(z) for z in hparams.tolist()])
-        with open(logpath, "a+", encoding="utf8") as output_file:
-            output_file.write(f"{data_fpath},RBF,"
-                        f"{hyperparams},"
-                        f"16384,CG,{ratio},"
-                        f"{max_rank},{losses}\n")
-
-        _, losses = xgp.fit(train_dset, tol = 1e-6,
-                        preset_hyperparams = hparams,
-                        run_diagnostics = True,
-                        max_iter = 100,
-                        preconditioner = preconditioner,
-                        mode = "sgd")
-        losses = "_".join([str(z) for z in losses])
-        hyperparams = "_".join([str(z) for z in hparams.tolist()])
-        with open(logpath, "a+", encoding="utf8") as output_file:
-            output_file.write(f"{data_fpath},RBF,"
-                        f"{hyperparams},"
-                        f"16384,SVRG,{ratio},"
-                        f"{max_rank},{losses}\n")
-
-
-
-def run_lbfgs_tests(start_dir):
-    """Test lbfgs procedures and save the number of iterations
-    required to converge.
-
-    Args:
-        start_dir (str): The dir where this script is located.
-    """
-
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "cglog.txt"))
-    target_datasets = ["kin40k_dataset", "song_dataset", "uci_protein_dataset"]
-    target_datasets = [os.path.join(f, "y_norm") for f in target_datasets]
-    target_datasets.append(os.path.join("fluorescence_eval", "onehot", "standard"))
-
-    for split in ["three_vs_rest", "two_vs_rest"]:
-        target_datasets.append(os.path.join("gb1_eval", "onehot", split))
-    for split in ["mut_des_split", "seven_vs_many_split"]:
-        target_datasets.append(os.path.join("aav_eval", "onehot", split))
-    target_datasets = [os.path.join(start_dir, "benchmark_evals", f) for
-                        f in target_datasets]
-
-    for data_fpath, hparams in zip(target_datasets,
-                    cg_constants.preset_hyperparams):
-        train_dset, _, _ = get_train_test_datasets(start_dir, data_fpath, "RBF")
-        for fitting_rff in cg_constants.fitting_rffs:
-            print(f"Now working on {data_fpath}, L-BFGS")
-            wclock = time.time()
-            xgp = xGPRegression(training_rffs = 512,
-                        variance_rffs = 64, fitting_rffs = fitting_rff,
-                        kernel_choice = "RBF", device = "gpu",
-                        verbose = True)
-            niter, _ = xgp.fit(train_dset,
-                        tol = 1e-6,
-                        preset_hyperparams = hparams,
-                        run_diagnostics = True,
-                        max_iter = 1000,
-                        mode = "lbfgs")
-            wclock = time.time() - wclock
-            hyperparams = "_".join([str(z) for z in hparams.tolist()])
-            with open(logpath, "a+", encoding="utf8") as output_file:
-                output_file.write(f"LBFGS,{data_fpath},RBF,"
-                        f"{hyperparams},"
-                        f"{fitting_rff},"
-                        f"{wclock},{niter},"
-                        "NA,NA\n")
-
-
-def run_cg_tests(start_dir):
-    """Test cg procedures and save the number of iterations
-    required to converge.
-
-    Args:
-        start_dir (str): The dir where this script is located.
-    """
-
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "cglog.txt"))
-    target_datasets = ["kin40k_dataset", "song_dataset", "uci_protein_dataset"]
-    target_datasets = [os.path.join(f, "y_norm") for f in target_datasets]
-    target_datasets.append(os.path.join("fluorescence_eval", "onehot", "standard"))
-
-    for split in ["three_vs_rest", "two_vs_rest"]:
-        target_datasets.append(os.path.join("gb1_eval", "onehot", split))
-    for split in ["mut_des_split", "seven_vs_many_split"]:
-        target_datasets.append(os.path.join("aav_eval", "onehot", split))
-    target_datasets = [os.path.join(start_dir, "benchmark_evals", f) for
-                        f in target_datasets]
-
-    for data_fpath, hparams in zip(target_datasets,
-                    cg_constants.preset_hyperparams):
-        train_dset, _, _ = get_train_test_datasets(start_dir, data_fpath, "RBF")
-        for fitting_rff in cg_constants.fitting_rffs:
-            for method in ["gauss", "srht", "srht_2"]:
-                if method != "srht" and fitting_rff > 16384:
-                    continue
-                for max_rank in cg_constants.precond_rank:
-                    print(f"Now working on {data_fpath}, {max_rank}")
-                    wclock = time.time()
-                    xgp = xGPRegression(training_rffs = 512,
-                        variance_rffs = 64, fitting_rffs = fitting_rff,
-                        kernel_choice = "RBF", device = "gpu",
-                        verbose = True)
-                    if max_rank == 0:
-                        if method != "srht":
-                            continue
-                        ratio = 0
-                        preconditioner = None
-                    else:
-                        preconditioner, ratio = xgp.build_preconditioner(train_dset,
-                            max_rank = max_rank, preset_hyperparams = hparams,
-                            method = method)
-                    niter, _ = xgp.fit(train_dset,
-                            preconditioner = preconditioner,
-                            tol = 1e-5,
-                            preset_hyperparams = hparams,
-                            run_diagnostics = True,
-                            max_iter = 1000,
-                            mode = "cg_test")
-                    wclock = time.time() - wclock
-                    hyperparams = "_".join([str(z) for z in hparams.tolist()])
-                    with open(logpath, "a+", encoding="utf8") as output_file:
-                        output_file.write(f"CG,{data_fpath},RBF,"
-                            f"{hyperparams},"
-                            f"{fitting_rff},"
-                            f"{wclock},{niter},"
-                            f"{ratio},{max_rank},{method}\n")
-
-
-
-
-def run_optimizer_tests(start_dir):
-    """Tests some of the various optimizers to check 1)
-    the best score they are able to achieve and 2) number
-    of func evals required to do it. Run using double-precision,
-    predefined bounds for clarity.
-
-    Args:
-        start_dir (str): The filepath where this script is located.
-    """
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "optimizelog.txt"))
-    target_datasets = [os.path.join("kin40k_dataset", "y_norm"),
-                        os.path.join("song_dataset", "y_norm"),
-                        os.path.join("uci_protein_dataset", "y_norm")]
-    target_datasets += [os.path.join("gb1_eval", "onehot", "three_vs_rest"),
-                            os.path.join("aav_eval", "onehot", "mut_des_split")]
-    target_datasets = [os.path.join(start_dir, "benchmark_evals", f) for f
-                        in target_datasets]
-
-    for data_fpath in target_datasets:
-        train_dset, _, _ = get_train_test_datasets(start_dir, data_fpath, "RBF")
-        for optimizer in ["bayes", "bfgs"]:
-            print(f"Now working on {data_fpath}, {optimizer}.")
-            tuning_wclock = time.time()
-            xgp = xGPRegression(training_rffs = 512, fitting_rffs = 512,
-                        variance_rffs = 64, kernel_choice = "RBF",
-                        device = "gpu", verbose = True)
-            if optimizer == "bayes":
-                #Set eigval_quotient to a very large value and min_eigval to very small
-                #to completely turn off filtering for small eigenvalues, which is beneficial
-                #for stability but has a small (<1%) impact on best marginal likelihood
-                hparam, nfev, mnll, _ = xgp.tune_hyperparams_crude_bayes(train_dset,
-                                    bounds = general_constants.OPTIMIZER_TEST_BOUNDS,
-                                    bayes_tol = 1e-2, n_pts_per_dim = 30, n_cycles = 4,
-                                    surrogate_kernel = "Matern", eigval_quotient = 1e10,
-                                    min_eigval = 1e-6)
-            elif optimizer == "bfgs":
-                hparam, nfev, mnll = xgp.tune_hyperparams_crude_lbfgs(train_dset,
-                                    n_restarts = 5,
-                                    bounds = general_constants.OPTIMIZER_TEST_BOUNDS)
-            tuning_wclock = time.time() - tuning_wclock
-            hparam = "_".join([str(z) for z in hparam.tolist()])
-            with open(logpath, "a+", encoding="utf8") as output_file:
-                data_name = "_".join(data_fpath.split("/")[-3:])
-                output_file.write(f"{data_name},RBF,"
-                    f"{hparam},"
-                    f"512,"
-                    f"{tuning_wclock},{nfev},"
-                    f"{optimizer},{mnll}\n")
-
-
-def run_uci_tests(start_dir):
-    """Run tests with the UCI datasets for comparison with GPyTorch."""
-    logpath = os.path.abspath(os.path.join("final_results", "ucilog.txt"))
-    target_datasets = [os.path.join(start_dir, "benchmark_evals", f) for f
-                    in uci_constants.target_datasets]
-    for data_fpath, dset_name in zip(target_datasets, uci_constants.target_datasets):
-        train_dset, test_xfiles, test_yfiles = get_train_test_datasets(start_dir,
-                                     data_fpath, "RBF")
-        for training_rff in zip(uci_constants.training_low_rffs,
-                                    uci_constants.training_high_rffs):
-            print(f"Now working on {data_fpath}, {training_rff}")
-            xgp, hyperparams, nfev, tuning_wclock, _ = tune_model_bayes(train_dset,
-                                training_rff[0], training_rff[1], kernel = "RBF",
-                                nmll_rank = uci_constants.nmll_settings[dset_name][0],
-                                nmll_mode = uci_constants.nmll_settings[dset_name][1])
-            for fitting_rff in uci_constants.fitting_rffs:
-                xgp.fitting_rffs = fitting_rff
-                spearman_score, mae_score, fitting_wclock = fit_and_score(xgp, train_dset,
-                            test_xfiles, test_yfiles, mode = "cg_test", tol = 1e-6,
-                            precond_method = uci_constants.nmll_settings[dset_name][1],
-                            precond_max_rank = uci_constants.nmll_settings[dset_name][0])
-                with open(logpath, "a+", encoding="utf8") as output_file:
-                    output_file.write(f"{data_fpath},RBF,"
-                        f"{hyperparams},"
-                        f"{training_rff[1]},"
-                        f"{fitting_rff},"
-                        f"{tuning_wclock},{nfev},"
-                        f"{fitting_wclock},{spearman_score},"
-                        f"{mae_score},bayes\n")
-
-
-def kernel_select(start_dir):
-    """Chooses the best kernel for the protein datasets by evaluating NMLL."""
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "kernel_sel.txt"))
-    existing_data = pd.read_csv(logpath)
-
-    for dataset_specifier, kernels in protein_constants.kernel_select_settings.items():
-        dset_name = "_".join([dataset_specifier[0], dataset_specifier[-1]])
-        dpath = os.path.join(*dataset_specifier)
-        target_dir = os.path.join(start_dir, "benchmark_evals", dpath)
-
-        for kernel in kernels:
-            print(f"{kernel},{dpath}")
-            existing_repeats = existing_data[existing_data["Dataset"]==dpath]
-            existing_repeats = existing_repeats[existing_repeats["Kernel_Type"]==kernel]
-            if existing_repeats.shape[0] > 0:
-                print(f"Hyperparameters for {dset_name} were already acquired!", flush = True)
-                continue
-            for random_seed in [123, 124, 125]:
-                print(f"Working on {dset_name}, kernel {kernel}", flush = True)
-                train_dset = get_train_dataset(start_dir, target_dir, kernel)
-                if protein_constants.fitting_settings[dset_name][3] == "bayes":
-                    _, hyperparams, _, tuning_wclock, nmll = tune_model_bayes(train_dset,
-                            	protein_constants.fitting_settings[dset_name][0], None,
-                            	kernel, random_seed = random_seed)
-                    tune_method = "bayes"
-                else:
-                    _, hyperparams, _, tuning_wclock, nmll = tune_model_lbfgs(train_dset,
-                            	protein_constants.fitting_settings[dset_name][0],
-                            	kernel, random_seed = random_seed)
-                    tune_method = "lbfgs"
-
-                with open(logpath, "a+", encoding="utf8") as output_file:
-                    output_file.write(f"{dpath},{kernel},"
-                            f"{hyperparams},"
-                            f"{protein_constants.fitting_settings[dset_name][0]},"
-                            f"{tuning_wclock},{nmll},"
-                            f"{tune_method},{random_seed}\n")
-
-
-def moltune(start_dir, pretransform_dir = None):
-    """Tunes hyperparameters for QM9."""
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "moltune.txt"))
-
-    target_dir = os.path.join(start_dir, "benchmark_evals", "chemdata")
-    train_dset, _ = get_qm9_train_dataset(start_dir, target_dir)
-
-    tuning_wclock = time.time()
-    xgp = xGPRegression(training_rffs = 16384,
-            fitting_rffs = 16384,
-            variance_rffs = 16,
-            kernel_choice = "GraphConv1d",
-            device = "gpu", verbose = True)
-
-
-    #These boundaries were generated on an initial "crude" tuning run
-    #by tuning using crude_bayes, then drawing a bounding box around this.
-    bounds = np.array([[-6.90775528, -5.14892235],
-                       [ 0.56216096,  3.06216096],
-                       [-0.03116022,  2.46883978]])
-    xgp.training_rffs = 16384
-    _, _, best_score = xgp.tune_hyperparams_fine_bayes(train_dset, bounds, 123,
-                              50, tol = 1e-1, nmll_rank = 2048,
-                              nmll_iter = 1000, nmll_tol = 1e-7,
-                              pretransform_dir = pretransform_dir,
-                              preconditioner_mode = "srht_2")
-    print(f"Best score: {best_score}")
-    tuning_wclock = time.time() - tuning_wclock
-    hyperparams = xgp.kernel.get_hyperparams(logspace=True)
-    hyperparams = "_".join([str(z) for z in hyperparams.tolist()])
-    print(hyperparams, flush = True)
-    with open(logpath, "a+", encoding="utf8") as output_file:
-        output_file.write(f"QM9,GraphConv1d,{hyperparams},"
-                            f"{xgp.training_rffs},"
-                            f"{tuning_wclock},{best_score}\n")
-
-
-
-def molfit(start_dir, pretransform_dir = None):
-    """Fits the model for QM9."""
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "molfit.txt"))
-    hparam_df = pd.read_csv(os.path.join("final_results", "moltune.txt"))
-    preset_hparams = np.asarray([float(f) for f in hparam_df.iloc[-1,2].split("_")])
-
-    target_dir = os.path.join(start_dir, "benchmark_evals", "chemdata")
-    os.chdir(target_dir)
-    qm9_model = xGPRegression(training_rffs = 12, fitting_rffs = 16384,
-                            device = "gpu", kernel_choice = "GraphConv1d",
-                            verbose = True)
-    for data_type in ["u298_atom", "h298_atom", "u0_atom", "zpve", "cv", "g298_atom"]:
-
-        start_time = time.time()
-        train_xfiles, train_yfiles = get_target_qm9_files("train", data_type)
-        os.chdir("..")
-        test_xfiles, test_yfiles = get_target_qm9_files("test", data_type)
-        os.chdir(target_dir)
-
-        train_dset = build_offline_sequence_dataset(train_xfiles, train_yfiles,
-                            skip_safety_checks=True)
-
-        for fitting_rff in [16384, 32768, 65536]:
-            qm9_model.fitting_rffs = fitting_rff
-            pre_dset = qm9_model.pretransform_data(train_dset, pretransform_dir = pretransform_dir,
-                                               preset_hyperparams = preset_hparams)
-            preconditioner, _ = qm9_model.build_preconditioner(pre_dset, max_rank = 3000,
-                                               preset_hyperparams = preset_hparams, method="srht_2")
-
-            qm9_model.fit(pre_dset, preconditioner=preconditioner, mode="cg",
-                    preset_hyperparams = preset_hparams, suppress_var = True, tol=1e-8,
-                    max_iter = 1000)
-
-            end_time = time.time()
-            fitting_wclock = end_time - start_time
-            print(f"Fitting wallclock time: {fitting_wclock}", flush=True)
-
-            all_preds, all_y = [], []
-            for xfile, yfile in zip(test_xfiles, test_yfiles):
-                x, y = np.load(xfile), np.load(yfile)
-                preds = qm9_model.predict(x, get_var = False, chunk_size=100)
-                all_preds.append(preds)
-                all_y.append(y)
-
-            all_preds = np.concatenate(all_preds)
-            all_y = np.concatenate(all_y)
-            mae = np.mean(np.abs(all_y - all_preds))
-            print(f"MAE for data type {data_type} on validation set is {mae}", flush=True)
-
-            with open(logpath, "a+", encoding="utf8") as output_file:
-                output_file.write(f"QM9,GraphConv1d,{hparam_df.iloc[0,2]},"
-                            f"{fitting_rff},{fitting_wclock},{mae},{data_type}\n")
-            pre_dset.delete_dataset_files()
-
-
-
-
-def run_protein_tests(start_dir, temp_dir = None):
-    """Runs a series of tests on the protein engineering datasets."""
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "proteinlog.txt"))
-
-    os.chdir("final_results")
-    kernel_sel = pd.read_csv("kernel_sel.txt")
-
-    kernel_sel["benchmark_group"] = [z.split("/")[0] for z in kernel_sel["Dataset"].tolist()]
-    kernel_sel["enc_type"] = [z.split("/")[1] for z in kernel_sel["Dataset"].tolist()]
-    kernel_sel["split"] = [z.split("/")[2] for z in kernel_sel["Dataset"].tolist()]
-    kernel_sel["group_split"] = ["_".join([bmark, enc]) for bmark, enc in
-            zip(kernel_sel["benchmark_group"].tolist(), kernel_sel["split"].tolist())]
-
-    for dset in kernel_sel["group_split"].unique().tolist():
-        dset_results = kernel_sel[kernel_sel["group_split"]==dset]
-        dset_results = dset_results.sort_values(by="NMLL", axis=0,
-                            ignore_index = True)
-
-        for i in range(dset_results.shape[0]):
-            hparams = [float(s) for s in dset_results["Hyperparams"][i].split("_")]
-            hparams = np.asarray(hparams)
-            data_fpath = os.path.join(start_dir, "benchmark_evals", dset_results["Dataset"][i])
-            kernel = dset_results["Kernel_Type"][i]
-            print(f"Working on dataset {dset}, using kernel {kernel}", flush = True)
-
-            train_dset, test_xfiles, test_yfiles = get_train_test_datasets(start_dir,
-                                 data_fpath, kernel)
-            xgp = xGPRegression(training_rffs = 512,
-                    fitting_rffs = protein_constants.fitting_settings[dset][1],
-                    variance_rffs = 64, kernel_choice = kernel,
-                    device = "gpu", verbose = True,
-                    kernel_specific_params = {"conv_width":9, "matern_nu":5/2})
-
-
-            if "conv" in kernel.lower():
-                pretransform_dir = temp_dir
-            else:
-                pretransform_dir = None
-
-            spearman_score, _, fitting_wclock = fit_and_score(xgp, train_dset,
-                        test_xfiles, test_yfiles, hparams = hparams,
-                        random_seed = dset_results["random_seed"].values[i],
-                        precond_max_rank = protein_constants.fitting_settings[dset][2],
-                        pretransform_dir = pretransform_dir, tol = 1e-6)
-
-            with open(logpath, "a+", encoding="utf8") as output_file:
-                output_file.write(f"{data_fpath},{kernel},"
-                            f"{hparams},"
-                            f"{protein_constants.fitting_settings[dset][0]},"
-                            f"{protein_constants.fitting_settings[dset][1]},"
-                            f"{fitting_wclock},{spearman_score},"
-                            f"{protein_constants.fitting_settings[dset][3]}\n")
-
-
-def run_other_tests(start_dir, pretransform_dir = None):
-    """Runs a series of tests on some tabular datasets."""
-    os.chdir(start_dir)
-    logpath = os.path.abspath(os.path.join("final_results", "other_tests.txt"))
-
-    for dset_name in ["song_dataset", "rossman", "sulfur"]:
-        print(dset_name)
-        dset_settings = general_constants.dset_settings[dset_name]
-
-        target = os.path.join(start_dir, "benchmark_evals", dset_name, "standard")
-        score_std_dev = 0
-        if "sulfur" in dset_name:
-            score, tuning_wclock, fitting_wclock, score_std_dev = \
-                    run_cv(start_dir, target, dset_settings["low_train_rffs"],
-                            dset_settings["high_train_rffs"],
-                            precond_rank = dset_settings["precond_rank"],
-                            kernel_choice = "Matern")
-            hparams = "5xCV"
-        else:
-            train_dset, test_xfiles, test_yfiles = get_train_test_datasets(start_dir,
-                                    target, "Matern")
-            xgp, hparams, _, tuning_wclock, _ = tune_model_bayes(train_dset,
-                    dset_settings["low_train_rffs"],
-                    dset_settings["high_train_rffs"], kernel = "Matern",
-                    nmll_rank = dset_settings["precond_rank"],
-                    pretransform_dir = pretransform_dir)
-            xgp.fitting_rffs = dset_settings["fitting_rff"]
-            score, _, fitting_wclock = fit_and_score(xgp, train_dset,
-                            test_xfiles, test_yfiles, score_type = "mse",
-                            precond_max_rank = dset_settings["precond_rank"],
-                            precond_method = dset_settings["precond_method"])
-        with open(logpath, "a+", encoding="utf8") as output_file:
-            output_file.write(f"{dset_name},Matern,"
-                            f"{hparams},"
-                            f"{dset_settings['high_train_rffs']},32768,"
-                            f"{tuning_wclock},"
-                            f"{fitting_wclock},{score},"
-                            f"{score_std_dev}\n")
 
 
 
@@ -632,26 +43,33 @@ def prep_exp_logfiles():
     """Sets up the logfiles to which experiment results will
     be written (if they are not already present)."""
     os.chdir("final_results")
-    if "kernel_sel.txt" not in os.listdir():
-        with open("kernel_sel.txt", "w+", encoding="utf8") as logfile:
+    if "conv_tune.txt" not in os.listdir():
+        with open("conv_tune.txt", "w+", encoding="utf8") as logfile:
             logfile.write("Dataset,Kernel_Type,Hyperparams,"
                     "Num_Train_RFFs,Tuning_Time,"
-                    "NMLL,optimizer,random_seed\n")
-    if "ucilog.txt" not in os.listdir():
-        with open("ucilog.txt", "w+", encoding="utf8") as logfile:
-            logfile.write("Dataset,Kernel_Type,"
-                    "Hyperparams,"
-                    "Num_Train_RFFs,Num_Fitting_RFFs,"
-                    "Tuning_Time,Num_func_evals,"
-                    "Fitting_Time,Spearmanr,MAE,"
-                    "optimizer\n")
-    if "proteinlog.txt" not in os.listdir():
-        with open("proteinlog.txt", "w+", encoding="utf8") as logfile:
+                    "NMLL,random_seed\n")
+    if "conv_fit.txt" not in os.listdir():
+        with open("conv_fit.txt", "w+", encoding="utf8") as logfile:
             logfile.write("Dataset,Kernel_Type,"
                     "Hyperparams,"
                     "Num_Train_RFFs,Num_Fitting_RFFs,"
                     "Fitting_Time,Spearmanr,"
-                    "optimizer\n")
+                    "random_seed\n")
+    if "moltune.txt" not in os.listdir():
+        with open("moltune.txt", "w+", encoding="utf8") as logfile:
+            logfile.write("Dataset,Kernel_Type,Hyperparams,"
+                    "Num_Train_RFFs,Tuning_Time,"
+                    "NMLL\n")
+    if "mol_pretune.txt" not in os.listdir():
+        with open("mol_pretune.txt", "w+", encoding="utf8") as logfile:
+            logfile.write("Dataset,Kernel_Type,Hyperparams,"
+                    "Num_Train_RFFs,Tuning_Time,"
+                    "NMLL\n")
+    if "molfit.txt" not in os.listdir():
+        with open("molfit.txt", "w+", encoding="utf8") as logfile:
+            logfile.write("Dataset,Kernel_Type,Hyperparams,"
+                    "Num_Fit_RFFs,Fitting_Time,"
+                    "Test_MAE\n")
     if "optimizelog.txt" not in os.listdir():
         with open("optimizelog.txt", "w+", encoding="utf8") as logfile:
             logfile.write("Dataset,Kernel_Type,"
@@ -665,14 +83,7 @@ def prep_exp_logfiles():
                     "Hyperparams,"
                     "Num_Fitting_RFFs,"
                     "Fitting_Time,Niter,"
-                    "achieved_ratio,method\n")
-    if "other_tests.txt" not in os.listdir():
-        with open("other_tests.txt", "w+", encoding="utf8") as logfile:
-            logfile.write("Dataset,Kernel_Type,"
-                    "Hyperparams,Num_Tuning_RFFs,"
-                    "Num_Fitting_RFFs,"
-                    "Tuning_Time,Fitting_Time,"
-                    "mse\n")
+                    "achieved_ratio,max_rank,method\n")
     if "fitcomp_log.txt" not in os.listdir():
         with open("fitcomp_log.txt", "w+", encoding="utf8") as logfile:
             logfile.write("Dataset,Kernel_Type,"
@@ -687,16 +98,16 @@ def prep_exp_logfiles():
                     "Num_Training_RFFs,"
                     "exact_nmll,approx_nmll,"
                     "condition_number\n")
-    if "moltune.txt" not in os.listdir():
-        with open("moltune.txt", "w+", encoding="utf8") as logfile:
-            logfile.write("Dataset,Kernel_Type,Hyperparams,"
-                    "Num_Train_RFFs,Tuning_Time,"
-                    "NMLL\n")
-    if "molfit.txt" not in os.listdir():
-        with open("molfit.txt", "w+", encoding="utf8") as logfile:
-            logfile.write("Dataset,Kernel_Type,Hyperparams,"
-                    "Num_Fit_RFFs,Fitting_Time,"
-                    "Test_MAE\n")
+    if "uncert_quant.txt" not in os.listdir():
+        with open("uncert_quant.txt", "w+", encoding="utf8") as logfile:
+            logfile.write("Dataset,Kernel_Type,"
+                    "Hyperparams,"
+                    "Num_Fitting_RFFs,"
+                    "MAE,spearman_r,"
+                    "miscalibration_area\n")
+    if "active_learn_log.txt" not in os.listdir():
+        with open("active_learn_log.txt", "w+", encoding="utf8") as logfile:
+            logfile.write("Random_seed,Iteration,Mean_fitness,Max_fitness\n")
     os.chdir("..")
 
 
@@ -714,10 +125,9 @@ def main():
     prep_exp_logfiles()
 
     task = args.test[0]
-    if task == "kernel_select":
-        kernel_select(start_dir)
-    if task == "uci":
-        run_uci_tests(start_dir)
+    if task == "protein_tune":
+        protein_tune(start_dir, protein_constants.conv_tuning_params,
+                "conv_tune.txt")
     elif task == "optimizers":
         run_optimizer_tests(start_dir)
     elif task == "cg":
@@ -726,16 +136,17 @@ def main():
         run_lbfgs_tests(start_dir)
     elif task == "nmll":
         run_approx_nmll_tests(start_dir)
-    elif task == "proteins":
-        run_protein_tests(start_dir, args.temp_dir[0])
-    elif task == "moltune":
-        moltune(start_dir, args.temp_dir[0])
-    elif task == "molfit":
-        molfit(start_dir, args.temp_dir[0])
-    elif task == "others":
-        run_other_tests(start_dir)
     elif task == "fitcomp":
         run_fitcomp_tests(start_dir)
+    elif task == "protein_fit":
+        protein_fit(start_dir, "conv_fit.txt", "conv_tune.txt")
+    elif task == "molfit":
+        molfit(start_dir, args.temp_dir[0])
+    elif task == "uncert_calib":
+        uncertainty_calibration(start_dir)
+    elif task == "active_learn":
+        active_learning(start_dir)
+
 
 if __name__ == "__main__":
     main()

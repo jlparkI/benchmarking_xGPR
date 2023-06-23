@@ -7,6 +7,10 @@ import sys
 import numpy as np
 from Bio import SeqIO
 
+#The wildcard import here is normally undesirable, but
+#in this case, pfasum_matrices contains only a short
+#list of classes specified by the generate pssm loadfiles
+#script.
 from .pfasum_matrices import *
 
 
@@ -37,8 +41,8 @@ def _str_to_class(classname):
     """Converts a string to a classname. Useful for converting inputs
     to MSAEncodingToolkit into class names for loading an appropriate
     PSSM."""
-    return getattr(sys.modules["xGPR.protein_tools.pfasum_matrices"],
-                        classname)
+    pfasum_module = [m for m in sys.modules if "pfasum_matrices" in m]
+    return getattr(sys.modules[pfasum_module[0]], classname)
 
 
 
@@ -228,6 +232,75 @@ class MSAEncodingToolkit():
             print("All files generated.")
 
 
+
+    def encode_fasta_file_with_msa(self, filepath, yvalues, output_dir, msa,
+                        pos_weights, blocksize = None, verbose = True):
+        """Encodes a fasta file of protein seqs and an associated list
+        of y-values, storing the results as numpy arrays in .npy
+        files, each to contain 'blocksize' sequences, using information
+        from an MSA. Since an MSA is used, the sequences must all be
+        of the same length.
+
+        Args:
+            filepath (str): A filepath to a fasta file.
+            yvalues (list): A list of y-values, one per sequence. Must
+                be the same length as the number of sequences in
+                the fasta file.
+            output_dir (str): A valid filepath where the output will
+                be saved.
+            msa (np.ndarray): A (num_positions, num_possible_aas) numpy
+                array storing the probability of each aa at each position.
+            max_entropy (float): The maximum entropy expected. The default
+                value is for 21 possible amino acids, change this if
+                there is a different number.
+            blocksize: Either None or an int. If None, all sequences
+                will be saved to a single npy file -- only recommended
+                for very small datasets. For anything larger, a blocksize
+                should be set. 2000 is a good default.
+            verbose (bool): If True, regular updates are printed.
+        """
+        self.run_input_checks(blocksize, output_dir)
+        try:
+            filehandle = open(filepath, "r")
+            filehandle.close()
+        except:
+            raise ValueError("Invalid filepath supplied "
+                    "for the fasta file!")
+        self.run_input_checks(blocksize, output_dir)
+        blocknum, ycounter = 0, 0
+        encoded_data = []
+        print(msa.shape)
+
+        with open(filepath, "r") as filehandle:
+            for seqrec in SeqIO.parse(filehandle, "fasta"):
+                seqstring = str(seqrec.seq)
+                if len(seqstring) != msa.shape[0]:
+                    import pdb
+                    pdb.set_trace()
+                    raise ValueError("Not all of the sequences in the specified "
+                            "fasta file are of the same length. The MSA encoder can "
+                            "only accept an MSA as input "
+                            "(sequences aligned to all be same length).")
+                encoded_seq = self.encode_seq_with_msa(seqstring, msa, pos_weights)
+                encoded_data.append(encoded_seq)
+                if blocksize is not None:
+                    if len(encoded_data) >= blocksize:
+                        self.save_data(encoded_data, yvalues,
+                            ycounter, blocksize, blocknum)
+                        encoded_data = []
+                        blocknum += 1
+                        ycounter += blocksize
+                        if verbose:
+                            print(f"Blocknum {blocknum} complete.")
+
+            self.save_data(encoded_data, yvalues,
+                        ycounter, blocksize, blocknum)
+        if verbose:
+            print("All files generated.")
+
+
+
+
     def save_data(self, encoded_data, yvalues, ycounter,
             blocksize, blocknum):
         """Saves a block of data.
@@ -290,9 +363,33 @@ class MSAEncodingToolkit():
                 idx = self.aas[letter]
                 encoded_data[0,i,:] = self.reps[idx,:]
         except:
-            raise ValueError("The sequence %s contains a nonstandard amino acid "
-                    "character and could not be encoded properly."%seqstring)
+            raise ValueError(f"The sequence {seqstring} contains a nonstandard amino acid "
+                    "character and could not be encoded properly.")
         if mode == "flat":
             encoded_data =encoded_data.reshape((1, encoded_data.shape[1] *
                 encoded_data.shape[2]))
+        return encoded_data
+
+
+    def encode_seq_with_msa(self, seqstring, msa, pos_weights):
+        """Encodes an input sequence using an msa supplied by caller.
+
+        Args:
+            seqstring (str): A protein sequence as a string.
+            msa (np.ndarray): A (num_positions, num_possible_aas) numpy
+                array storing the probability of each aa at each position.
+            pos_weights (np.ndarray): A (num_positions) array indicating the relative
+                weighting for each position.
+        """
+        encoded_data = np.zeros((1, len(seqstring) * self.reps.shape[1]))
+        start_position = len(seqstring) * self.reps.shape[1]
+        try:
+            for i, letter in enumerate(seqstring):
+                idx = self.aas[letter]
+                #encoded_data[0,i*self.reps.shape[1]:(i+1)*self.reps.shape[1]] = \
+                #    self.reps[idx,:] * pos_weights[i]
+                encoded_data[0,i*self.reps.shape[1]:(i+1)*self.reps.shape[1]] = msa[i,idx,:]
+        except:
+            raise ValueError(f"The sequence {seqstring} contains a nonstandard amino acid "
+                    "character and could not be encoded properly.")
         return encoded_data

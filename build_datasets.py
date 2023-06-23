@@ -16,7 +16,7 @@ from data_preprocessing_scripts.gb1_preprocessing import prep_gb1
 from data_preprocessing_scripts.uci_datasets_prep import prep_UCI_dataset
 from data_preprocessing_scripts.stability_preprocessing import prep_stability
 from data_preprocessing_scripts.generate_conv_transform import get_conv_transform
-from data_preprocessing_scripts.tabular_data_preprocessing import prep_tabular_datasets
+from data_preprocessing_scripts.act_learn_prep import prep_act_learn
 
 def gen_arg_parser():
     """Set up the argument parser for the command line input."""
@@ -37,12 +37,11 @@ def gen_arg_parser():
     parser.add_argument("--gb1", action="store_true", help=
             "Preprocess the GB1 dataset.")
     parser.add_argument("--uci", action="store_true", help=
-            "Preprocess the three UCI datasets for comparison with GPyTorch.")
+            "Preprocess the UCI datasets.")
     parser.add_argument("--molecules", action="store_true", help=
             "Preprocess the qm9 small molecules dataset.")
-    parser.add_argument("--tabular", action="store_true", help=
-            "Preprocess the additional tabular datasets for comparison with "
-            "other algorithms.")
+    parser.add_argument("--actlearn", action="store_true", help=
+            "Preprocess the active learning data.")
     return parser
 
 def get_raw_data(start_dir):
@@ -99,20 +98,45 @@ def get_raw_data(start_dir):
         os.remove(fname)
     print("QM9 downloaded.")
 
-    os.chdir(start_dir)
-    os.chdir(os.path.join("benchmark_evals", "song_dataset", "raw_data"))
-    if "raw_data_.csv" not in os.listdir():
-        fname = wget.download("https://archive.ics.uci.edu/ml/machine-learning-databases/00203/YearPredictionMSD.txt.zip")
-        with zipfile.ZipFile(fname, "r") as zip_ref:
-            zip_ref.extractall()
-        os.rename("YearPredictionMSD.txt", "raw_data_.csv")
-        os.remove(fname)
-    print("SONG dataset downloaded.")
+    try:
+        os.chdir(os.path.join(start_dir, "benchmark_evals", "song_dataset", "raw_data"))
+        if "raw_data_.csv" not in os.listdir():
+            fname = wget.download("https://archive.ics.uci.edu/ml/machine-learning-databases/00203/YearPredictionMSD.txt.zip")
+            with zipfile.ZipFile(fname, "r") as zip_ref:
+                zip_ref.extractall()
+            os.rename("YearPredictionMSD.txt", "raw_data_.csv")
+            os.remove(fname)
+        print("SONG dataset downloaded.")
+    except:
+        print("Error downloading SONG dataset from UCI machine learning repository!")
+
+    #Load and clean up the Sarkisyan et al data.
+    os.chdir(os.path.join(start_dir, "benchmark_evals", "sarkisyan_et_al"))
+    if "data" not in os.listdir():
+        fname = wget.download("http://cb.csail.mit.edu/cb/uncertainty-ml-mtb/data.tar.gz")
+        subprocess.run(["tar", "-xzf", fname], check = True)
+        subprocess.run(["rm", "-rf", fname], check = True)
+        os.chdir("data")
+        subprocess.run(["rm", "-rf", "bepler2019embedding"], check = True)
+        subprocess.run(["rm", "-rf", "davis2011kinase"], check = True)
+        subprocess.run(["rm", "-rf", "docking"], check = True)
+        subprocess.run(["rm", "-rf", "norman2019_k562"], check = True)
+        for fname in os.listdir():
+            if fname.endswith(".txt"):
+                os.remove(fname)
+        os.chdir("sarkisyan2016gfp")
+        for fname in os.listdir():
+            if fname.endswith(".txt"):
+                os.rename(fname, f"{fname.split('.txt')[0] + '_.txt'}")
+            else:
+                os.remove(fname)
+
 
     os.chdir(start_dir)
 
 
 def main():
+    """Entry point for all dataset building tasks."""
     start_dir = os.path.dirname(os.path.abspath(__file__))
     parser = gen_arg_parser()
     args = parser.parse_args()
@@ -137,30 +161,33 @@ def main():
     if args.stab:
         prep_stability(start_dir)
         get_conv_transform(start_dir, "stability")
-    if args.molecules:
-        os.chdir(os.path.join(start_dir, "chemtools"))
-        benchmark_path = os.path.join(start_dir, "benchmark_evals")
-        chemdata_path = os.path.join(benchmark_path, "chemdata")
-        if "cleaned_qm9_mols" not in os.listdir():
-            subprocess.run(["python", "molcleaner.py", chemdata_path], check = True)
-
-        os.chdir(os.path.join(start_dir, "chemtools"))
-        subprocess.run(["python", "soap_maker.py", chemdata_path,
-                    start_dir], check = True)
-        os.chdir(start_dir)
     if args.uci:
         for dataset in ["kin40k_dataset", "uci_protein_dataset",
                         "song_dataset"]:
             os.chdir(start_dir)
             prep_UCI_dataset(start_dir, dataset, "y_norm")
-    if args.tabular:
-        for dataset in ["song_dataset", "rossman", "sulfur"]:
-            os.chdir(start_dir)
-            #Song data is under a different filename for raw data.
-            if "song" in dataset:
-                prep_tabular_datasets(start_dir, dataset, "raw_data_.csv")
-            else:
-                prep_tabular_datasets(start_dir, dataset)
+    if args.actlearn:
+        prep_act_learn(start_dir)
+    if args.molecules:
+        os.chdir(os.path.join(start_dir, "chemtools"))
+        benchmark_path = os.path.join(start_dir, "benchmark_evals")
+        chemdata_path = os.path.join(benchmark_path, "chemdata")
+        os.chdir(chemdata_path)
+
+        if "full_soap" not in os.listdir():
+            os.mkdir("full_soap")
+        if "cleaned_qm9_mols" not in os.listdir():
+            os.chdir(os.path.join(start_dir, "chemtools"))
+            subprocess.run(["python", "molcleaner.py", chemdata_path], check = True)
+
+        full_soap_path = os.path.join(chemdata_path, "full_soap")
+        print("Mol cleaning complete", flush=True)
+
+        os.chdir(os.path.join(start_dir, "chemtools"))
+
+        print("Now encoding full soap")
+        subprocess.run(["python", "soap_maker.py", full_soap_path,
+                    chemdata_path], check = True)
 
 
 if __name__ == "__main__":

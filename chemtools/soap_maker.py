@@ -1,4 +1,3 @@
-
 """xyz files, using the yvalues obtained from molecule_net as labels
 (we do this for consistency, to be certain we are using the same
 y-values as other publications).
@@ -40,7 +39,6 @@ def get_id(fname):
 def featurize_split(cv_split, yval_dict, output_fname):
     """Generates .npy files containing 'chunked' data
     for the input list of xyz files.
-
     Args:
         cv_split (list): A list of xyz files.
         yval_dict (dict): A dictionary mapping mol ids
@@ -48,7 +46,7 @@ def featurize_split(cv_split, yval_dict, output_fname):
         output_fname (str): A string containing the
             prefix for all output file names.
     """
-    structs, yvals, indices = [], [], []
+    structs, yvals, indices, atom_ids = [], [], [], []
     species = {"C", "H", "O", "N", "F"}
 
     conv_soaper = SOAP(species=species,
@@ -64,23 +62,24 @@ def featurize_split(cv_split, yval_dict, output_fname):
         mol_id = get_id(xyz_file)
         structs.append(read(xyz_file))
         yvals.append(yval_dict[mol_id])
+        atom_ids.append([atom_key[s] for s in structs[-1].get_chemical_symbols()
+            if s != "H"])
         indices.append([s for s, i in
                 enumerate(structs[-1].get_chemical_symbols()) if i != "H"])
         if len(structs) >= BATCH_SIZE:
             blend_soap(conv_soaper, structs, yvals,
-                    indices, batchnum, output_fname)
-            structs, yvals, indices = [], [], []
+                    indices, batchnum, output_fname, atom_ids)
+            structs, yvals, indices, atom_ids = [], [], [], []
             batchnum += 1
     if len(structs) > 0:
         blend_soap(conv_soaper, structs, yvals,
-                indices, batchnum, output_fname)
+                indices, batchnum, output_fname, atom_ids)
 
 
 def blend_soap(conv_soaper, structs, yvals,
-        indices, batchnum, output_fname):
+        indices, batchnum, output_fname, atom_ids):
     """Performs the actual work of converting a minibatch of molecules
     into soap descriptors and saving to file.
-
     Args:
         conv_soaper: The object that will generate the SOAP descriptors for
             use by convolution kernels.
@@ -98,22 +97,24 @@ def blend_soap(conv_soaper, structs, yvals,
     print("SOAPing another batch...")
     xmats = conv_soaper.create(structs, positions = indices, n_jobs=1)
     ydata = np.stack(yvals)
-    zero_padded = [np.zeros((9, xmats[0].shape[1])) for xmat in xmats]
+    zero_padded = [np.zeros((9, xmats[0].shape[1] + len(atom_key))) for xmat in xmats]
     for i, xmat in enumerate(xmats):
         xmat /= np.linalg.norm(xmat, axis=1)[:,None]
         zero_padded[i][:xmats[i].shape[0], :xmats[i].shape[1]] = xmat
+        for j, idx in enumerate(atom_ids[i]):
+            zero_padded[i][j, xmat.shape[1] + idx] = 1.0
 
     xmats = np.stack(zero_padded).astype(np.float32)
     print(f"{xmats.shape}")
 
-    print("Saving another batch...")
+    print("Saving another batch...", flush=True)
     np.save(f"{output_fname}_{batchnum}_xfolded.npy", xmats)
     for j, dtype in enumerate(DTYPES):
         np.save(f"{output_fname}_{batchnum}_{dtype}_yvalues.npy",
                         ydata[:,j])
 
 
-def featurize_xyzfiles(target_dir, start_dir):
+def featurize_xyzfiles(target_dir, chemdata_path):
     """Obtains a list of xyz files for a target directory, splits them
     up into train - valid - test, and sets them up for feature generation."""
     
@@ -122,7 +123,7 @@ def featurize_xyzfiles(target_dir, start_dir):
         for line in fhandle:
             bad_mols.add(int(line.split()[0]))
     
-    os.chdir(target_dir)
+    os.chdir(chemdata_path)
     yval_dict = get_yvalue_dict()
     os.chdir("cleaned_qm9_mols")
     raw_xyz_files = [os.path.abspath(f) for f in os.listdir() if f.endswith("xyz")]
@@ -154,7 +155,6 @@ def featurize_xyzfiles(target_dir, start_dir):
         os.chdir("..")
 
     print("All done.")
-    os.chdir(start_dir)
 
 if __name__ == "__main__":
-    featurize_xyzfiles(sys.argv[1], os.getcwd())
+    featurize_xyzfiles(sys.argv[1], sys.argv[2])    
