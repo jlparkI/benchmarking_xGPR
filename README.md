@@ -38,11 +38,10 @@ can be retrieved by running the script from command line, e.g.:
     python build_datasets.py
 ```
 
-which will retrieve a list like the following:
-
-![build datasets](images/build_datasets.png)
-
-so that you can construct the datasets most relevant to the experiments
+Running the script without any options supplied (or with `--help`) will
+return a list of the available options. There is an option to construct
+the features for each of the datasets used in these experiments,
+so you can construct the datasets most relevant to the experiments
 that interest you. Note that the amount of disk space taken up by all
 constructed datasets is quite substantial (about 150 GB). This is
 because there are many datasets, some of the datasets have a substantial
@@ -69,12 +68,9 @@ list of available experiments and choose one to run, enter:
     python run_experiments.py
 ```
 
-which will retrieve instructions like the following:
-
-![run experiments](images/run_experiments.png)
-
-so that you can reproduce the experiments of most interest to you.
-Note that some experiments may take a few hours to run on GPU.
+which if run without any options or with `--help` will retrieve a list
+of the available experiments, so that you can reproduce the experiments of
+most interest to you. Note that some experiments may take a few hours to run on GPU.
 The `kernel_sel` experiment, for example, involves tuning hyperparameters
 in triplicate with three different random seeds for 11 different
 benchmarks, i.e. tuning 33 different models, and the proteins
